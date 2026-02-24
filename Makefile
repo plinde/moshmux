@@ -2,7 +2,7 @@
 
 BINARY := moshmux
 
-.PHONY: build run clean deps check update help
+.PHONY: build run clean deps check lint test fmt update help
 
 .DEFAULT_GOAL := help
 
@@ -17,10 +17,16 @@ run: build ## Build and run moshmux
 deps: ## Download Go dependencies
 	go mod download
 
-check: ## Run vet on all packages
-	@echo "Go: $$(go version)"
-	@go vet ./...
-	@echo "OK"
+check: lint test ## Run linters and tests
+
+lint: ## Run golangci-lint
+	golangci-lint run ./...
+
+test: ## Run tests with race detector
+	go test -race ./...
+
+fmt: ## Format Go source files
+	gofmt -w .
 
 clean: ## Remove built binary
 	rm -f $(BINARY)

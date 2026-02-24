@@ -52,7 +52,7 @@ func gitRun(args ...string) {
 	case "push":
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			os.Stderr.Write(out)
+			_, _ = os.Stderr.Write(out)
 			fatal("git push: %s", err)
 		}
 		for _, line := range strings.Split(string(out), "\n") {
@@ -951,7 +951,7 @@ func cmdUpgrade(force bool) {
 	if !force {
 		fmt.Print("Kill old server and upgrade to tmux 3.6a? [y/N]: ")
 		var response string
-		fmt.Scanln(&response)
+		_, _ = fmt.Scanln(&response)
 		response = strings.ToLower(strings.TrimSpace(response))
 		if response != "y" && response != "yes" {
 			fmt.Println("Cancelled.")
