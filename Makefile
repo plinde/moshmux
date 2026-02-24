@@ -2,7 +2,7 @@
 
 BINARY := moshmux
 
-.PHONY: build run clean deps check lint test fmt update help
+.PHONY: build run clean deps check lint test fmt setup update help
 
 .DEFAULT_GOAL := help
 
@@ -30,6 +30,11 @@ fmt: ## Format Go source files
 
 clean: ## Remove built binary
 	rm -f $(BINARY)
+
+setup: ## Configure git hooks and dependencies
+	git config core.hooksPath .githooks
+	go mod download
+	@echo "Done. Pre-commit hooks enabled."
 
 ##@ Operations
 
