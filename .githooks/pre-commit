@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "pre-commit: checking gofmt..."
+unformatted=$(gofmt -l .)
+if [ -n "$unformatted" ]; then
+  echo "Files need formatting (run 'make fmt'):"
+  echo "$unformatted"
+  exit 1
+fi
+
+echo "pre-commit: checking go mod tidy..."
+cp go.mod go.mod.bak
+cp go.sum go.sum.bak
+go mod tidy
+if ! diff -q go.mod go.mod.bak >/dev/null 2>&1 || ! diff -q go.sum go.sum.bak >/dev/null 2>&1; then
+  mv go.mod.bak go.mod
+  mv go.sum.bak go.sum
+  echo "go.mod/go.sum not tidy (run 'go mod tidy')"
+  exit 1
+fi
+rm -f go.mod.bak go.sum.bak
+
+echo "pre-commit: running go vet..."
+go vet ./...
+
+echo "pre-commit: running tests..."
+go test ./...
+
+if command -v golangci-lint >/dev/null 2>&1; then
+  echo "pre-commit: running golangci-lint..."
+  golangci-lint run ./...
+fi
+
+echo "pre-commit: all checks passed"
