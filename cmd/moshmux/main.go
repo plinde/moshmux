@@ -128,28 +128,7 @@ func main() {
 		}
 		name := os.Args[2]
 		if name == "." {
-			cwd := cwdTilde()
-			aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
-			var match *moshmux.Alias
-			for i := range aliases {
-				if aliases[i].Dir == cwd {
-					match = &aliases[i]
-					break
-				}
-			}
-			if match != nil {
-				name = match.Name
-			} else {
-				// No dir match — check basename as a hint
-				base := filepath.Base(cwd)
-				for i := range aliases {
-					if aliases[i].Name == base {
-						fmt.Fprintf(os.Stderr, "No alias with dir %s. Did you mean %s?\n", cwd, base)
-						os.Exit(1)
-					}
-				}
-				fatal("no alias found matching directory %s", cwd)
-			}
+			name = resolveDot(readAliases()).Name
 		}
 		cmdRemove(name)
 	case "termius":
@@ -260,31 +239,100 @@ func cwdTilde() string {
 	return cwd
 }
 
-// cmdDot attaches to the tmux session matching cwd, or tells the user
-// to register it first. Matches by directory path first, then by name.
-func cmdDot() {
-	cwd := cwdTilde()
-	aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
+// readAliases parses moshmux.zsh and returns all configured aliases.
+func readAliases() []moshmux.Alias {
+	return moshmux.ParseAliases(readFile("moshmux.zsh"))
+}
 
-	// First: match by directory path
+// resolveDot resolves "." to an alias via cwd: match by dir path, then by basename.
+// Fatals if no match is found.
+func resolveDot(aliases []moshmux.Alias) *moshmux.Alias {
+	cwd := cwdTilde()
+
+	// Match by directory path
 	for i := range aliases {
 		if aliases[i].Dir == cwd {
-			attachSession(&aliases[i])
-			return
+			return &aliases[i]
 		}
 	}
 
-	// Second: match by cwd basename as alias name
+	// Match by cwd basename as alias name
 	base := filepath.Base(cwd)
 	for i := range aliases {
 		if aliases[i].Name == base {
-			attachSession(&aliases[i])
-			return
+			return &aliases[i]
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "No alias found for %s (tried dir match and name %q).\nRun: moshmux add .\n", cwd, base)
 	os.Exit(1)
+	return nil
+}
+
+// resolveAlias resolves an alias by exact name or unique prefix match.
+// Fatals if not found or ambiguous.
+func resolveAlias(name string, aliases []moshmux.Alias) *moshmux.Alias {
+	// Exact match first
+	for i := range aliases {
+		if aliases[i].Name == name {
+			return &aliases[i]
+		}
+	}
+
+	// Prefix match fallback
+	var matches []moshmux.Alias
+	for _, a := range aliases {
+		if strings.HasPrefix(a.Name, name) {
+			matches = append(matches, a)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		fatal("no alias %s found", name)
+	case 1:
+		return &matches[0]
+	default:
+		names := make([]string, len(matches))
+		for i, m := range matches {
+			names[i] = m.Name
+		}
+		fatal("ambiguous: %q matches %s", name, strings.Join(names, ", "))
+	}
+	return nil
+}
+
+// findRunningTmux finds a tmux binary that can talk to the running server.
+// Returns the binary path, or "" if no server is running.
+func findRunningTmux() string {
+	socket := tmuxSocketPath()
+	for _, bin := range tmuxBinaries() {
+		if err := exec.Command(bin, "-S", socket, "list-sessions").Run(); err == nil {
+			return bin
+		}
+	}
+	return ""
+}
+
+// expandHome expands ~/... to an absolute path.
+func expandHome(path string) string {
+	if strings.HasPrefix(path, "~") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, strings.TrimPrefix(path, "~"))
+	}
+	return path
+}
+
+// gitCommitAndPush stages moshmux.zsh, commits with the given message, and pushes.
+func gitCommitAndPush(msg string) {
+	gitRun("add", "moshmux.zsh")
+	gitRun("commit", "-m", msg)
+	gitRun("push")
+}
+
+// cmdDot attaches to the tmux session matching cwd, or tells the user
+// to register it first. Matches by directory path first, then by name.
+func cmdDot() {
+	attachSession(resolveDot(readAliases()))
 }
 
 // moshEnvPath returns the PATH for mosh-server's environment.
@@ -315,35 +363,22 @@ func cmdTermius(name string) {
 // cmdKillSession terminates the tmux session associated with the given alias name.
 // Accepts alias name or "." for cwd match. Errors if no session is running.
 func cmdKillSession(name string) {
+	aliases := readAliases()
 	if name == "." {
-		cwd := cwdTilde()
-		aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
-		for i := range aliases {
-			if aliases[i].Dir == cwd {
-				name = aliases[i].Name
-				break
-			}
-		}
-		if name == "." {
-			fatal("no alias found matching directory %s", cwdTilde())
-		}
+		name = resolveDot(aliases).Name
 	}
 
-	alias, err := moshmux.FindAlias(readFile("moshmux.zsh"), name)
-	if err != nil {
-		fatal("%s", err)
-	}
+	alias := resolveAlias(name, aliases)
 	session := alias.Session
 
-	socket := tmuxSocketPath()
-	var tmuxBin string
-	for _, bin := range tmuxBinaries() {
-		if err := exec.Command(bin, "-S", socket, "has-session", "-t", session).Run(); err == nil {
-			tmuxBin = bin
-			break
-		}
-	}
+	tmuxBin := findRunningTmux()
 	if tmuxBin == "" {
+		fmt.Fprintf(os.Stderr, "No tmux session '%s' is running.\n", session)
+		os.Exit(1)
+	}
+
+	socket := tmuxSocketPath()
+	if err := exec.Command(tmuxBin, "-S", socket, "has-session", "-t", session).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "No tmux session '%s' is running.\n", session)
 		os.Exit(1)
 	}
@@ -356,35 +391,7 @@ func cmdKillSession(name string) {
 
 // cmdName attaches to the tmux session with the given alias name.
 func cmdName(name string) {
-	aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
-
-	// Exact match first
-	for i := range aliases {
-		if aliases[i].Name == name {
-			attachSession(&aliases[i])
-			return
-		}
-	}
-
-	// Prefix match fallback
-	var matches []moshmux.Alias
-	for _, a := range aliases {
-		if strings.HasPrefix(a.Name, name) {
-			matches = append(matches, a)
-		}
-	}
-	switch len(matches) {
-	case 0:
-		fatal("no alias %s found", name)
-	case 1:
-		attachSession(&matches[0])
-	default:
-		names := make([]string, len(matches))
-		for i, m := range matches {
-			names[i] = m.Name
-		}
-		fatal("ambiguous: %q matches %s", name, strings.Join(names, ", "))
-	}
+	attachSession(resolveAlias(name, readAliases()))
 }
 
 // tmuxBinaries returns tmux paths to check, in preference order.
@@ -465,12 +472,7 @@ func findTmuxForSession(name string) string {
 
 // attachSession execs into a tmux session for the given alias.
 func attachSession(a *moshmux.Alias) {
-	dir := a.Dir
-	home, _ := os.UserHomeDir()
-	if strings.HasPrefix(dir, "~") {
-		dir = filepath.Join(home, strings.TrimPrefix(dir, "~"))
-	}
-
+	dir := expandHome(a.Dir)
 	socket := tmuxSocketPath()
 	tmux := findTmuxForSession(a.Session)
 	if err := syscall.Exec(tmux, []string{"tmux", "-S", socket, "new-session", "-AD", "-s", a.Session, "-c", dir}, os.Environ()); err != nil {
@@ -481,73 +483,21 @@ func attachSession(a *moshmux.Alias) {
 // cmdJoin resolves an alias name (with prefix matching and "." support)
 // and joins the existing tmux session with independent window focus.
 func cmdJoin(name string) {
+	aliases := readAliases()
 	if name == "." {
-		cwd := cwdTilde()
-		aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
-		found := false
-		for i := range aliases {
-			if aliases[i].Dir == cwd {
-				name = aliases[i].Name
-				found = true
-				break
-			}
-		}
-		if !found {
-			base := filepath.Base(cwd)
-			for i := range aliases {
-				if aliases[i].Name == base {
-					name = base
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			fatal("no alias found matching directory %s", cwdTilde())
-		}
+		name = resolveDot(aliases).Name
 	}
 
-	aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
-
-	// Exact match first, then prefix match
-	var alias *moshmux.Alias
-	for i := range aliases {
-		if aliases[i].Name == name {
-			alias = &aliases[i]
-			break
-		}
-	}
-	if alias == nil {
-		var matches []moshmux.Alias
-		for _, a := range aliases {
-			if strings.HasPrefix(a.Name, name) {
-				matches = append(matches, a)
-			}
-		}
-		switch len(matches) {
-		case 0:
-			fatal("no alias %s found", name)
-		case 1:
-			alias = &matches[0]
-		default:
-			names := make([]string, len(matches))
-			for i, m := range matches {
-				names[i] = m.Name
-			}
-			fatal("ambiguous: %q matches %s", name, strings.Join(names, ", "))
-		}
-	}
+	alias := resolveAlias(name, aliases)
 
 	// Verify the target session is actually running
-	socket := tmuxSocketPath()
-	var tmuxBin string
-	for _, bin := range tmuxBinaries() {
-		if err := exec.Command(bin, "-S", socket, "has-session", "-t", alias.Session).Run(); err == nil {
-			tmuxBin = bin
-			break
-		}
-	}
+	tmuxBin := findRunningTmux()
 	if tmuxBin == "" {
+		fatal("no tmux session '%s' is running — start it first with: moshmux %s", alias.Session, alias.Name)
+	}
+
+	socket := tmuxSocketPath()
+	if err := exec.Command(tmuxBin, "-S", socket, "has-session", "-t", alias.Session).Run(); err != nil {
 		fatal("no tmux session '%s' is running — start it first with: moshmux %s", alias.Session, alias.Name)
 	}
 
@@ -569,7 +519,7 @@ func joinSession(a *moshmux.Alias, tmuxBin, socket string) {
 }
 
 func cmdPicker() {
-	aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
+	aliases := readAliases()
 	if len(aliases) == 0 {
 		fatal("no aliases configured")
 	}
@@ -683,20 +633,13 @@ type sessionInfo struct {
 func tmuxSessions() map[string]sessionInfo {
 	m := make(map[string]sessionInfo)
 	home, _ := os.UserHomeDir()
-	socket := tmuxSocketPath()
 
-	// Try to find a tmux binary that can talk to the running server
-	var tmuxBin string
-	for _, bin := range tmuxBinaries() {
-		if err := exec.Command(bin, "-S", socket, "list-sessions").Run(); err == nil {
-			tmuxBin = bin
-			break
-		}
-	}
+	tmuxBin := findRunningTmux()
 	if tmuxBin == "" {
-		return m // No tmux binary can talk to server (or no server running)
+		return m
 	}
 
+	socket := tmuxSocketPath()
 	out, err := exec.Command(tmuxBin, "-S", socket, "list-sessions", "-F", "#{session_name}\t#{pane_current_path}\t#{session_attached}\t#{session_activity}").Output()
 	if err != nil {
 		return m
@@ -873,7 +816,7 @@ func renderTable(rows [][]string) string {
 }
 
 func cmdList(noTUI bool) {
-	aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
+	aliases := readAliases()
 	if len(aliases) == 0 {
 		fmt.Println("No aliases configured.")
 		return
@@ -924,9 +867,7 @@ func cmdAdd(name, target string) {
 		msg = fmt.Sprintf("Add %s alias (links to %s session)", name, session)
 	}
 
-	gitRun("add", "moshmux.zsh")
-	gitRun("commit", "-m", msg)
-	gitRun("push")
+	gitCommitAndPush(msg)
 
 	// Show what was created
 	if session == name {
@@ -946,10 +887,7 @@ func cmdUpdate(name, dir string) {
 
 	writeFile("moshmux.zsh", newZsh)
 
-	msg := fmt.Sprintf("Update %s path to %s", name, dir)
-	gitRun("add", "moshmux.zsh")
-	gitRun("commit", "-m", msg)
-	gitRun("push")
+	gitCommitAndPush(fmt.Sprintf("Update %s path to %s", name, dir))
 
 	fmt.Printf("Updated %s → %s\n", name, dir)
 }
@@ -964,10 +902,7 @@ func cmdRemove(name string) {
 
 	writeFile("moshmux.zsh", newZsh)
 
-	msg := fmt.Sprintf("Remove %s alias", name)
-	gitRun("add", "moshmux.zsh")
-	gitRun("commit", "-m", msg)
-	gitRun("push")
+	gitCommitAndPush(fmt.Sprintf("Remove %s alias", name))
 
 	fmt.Printf("Removed %s\n", name)
 }
@@ -991,7 +926,7 @@ func cmdUpgrade(force bool) {
 	// Old version detected - warn and prompt
 	fmt.Printf("Old tmux %s detected. Upgrade required.\n\n", version)
 
-	aliases := moshmux.ParseAliases(readFile("moshmux.zsh"))
+	aliases := readAliases()
 	sessions := tmuxSessions()
 	rows := buildRows(aliases, sessions)
 
