@@ -86,8 +86,8 @@ func usage() {
   moshmux termius <name>        Print Termius startup script (direct attach)
   moshmux join <name>           Join session with independent window focus
   moshmux join .                Join session matching cwd
-  moshmux upgrade               Detect and kill old tmux 2.6 server
-  moshmux upgrade --force       Kill old server without confirmation
+  moshmux upgrade               Detect and kill stale tmux server
+  moshmux upgrade --force       Kill stale server without confirmation
 `)
 	os.Exit(1)
 }
@@ -301,14 +301,79 @@ func resolveAlias(name string, aliases []moshmux.Alias) *moshmux.Alias {
 	return nil
 }
 
-// findRunningTmux finds a tmux binary that can talk to the running server.
-// Returns the binary path, or "" if no server is running.
+const (
+	minTmuxMajor         = 3
+	minTmuxMinor         = 0
+	recommendedTmuxVersion = "3.6a"
+)
+
+var cachedTmuxPath string
+
+// findTmux returns the path to a tmux binary that meets minimum version requirements.
+// Caches the result after first call. Fatals if no suitable tmux found.
+func findTmux() string {
+	if cachedTmuxPath != "" {
+		return cachedTmuxPath
+	}
+
+	bin, err := exec.LookPath("tmux")
+	if err != nil {
+		fatal("tmux not found in PATH (install tmux >= %d.%d, recommended %s)", minTmuxMajor, minTmuxMinor, recommendedTmuxVersion)
+	}
+
+	out, err := exec.Command(bin, "-V").Output()
+	if err != nil {
+		fatal("could not determine tmux version: %s", err)
+	}
+
+	major, minor, err := parseTmuxVersion(strings.TrimSpace(string(out)))
+	if err != nil {
+		fatal("could not parse tmux version %q: %s", strings.TrimSpace(string(out)), err)
+	}
+
+	if major < minTmuxMajor || (major == minTmuxMajor && minor < minTmuxMinor) {
+		fatal("tmux %d.%d is too old (need >= %d.%d, recommended %s)", major, minor, minTmuxMajor, minTmuxMinor, recommendedTmuxVersion)
+	}
+
+	cachedTmuxPath = bin
+	return bin
+}
+
+// parseTmuxVersion extracts the numeric version from "tmux X.Y[a-z]" output.
+// Returns major, minor as ints (e.g. "tmux 3.6a" → 3, 6).
+func parseTmuxVersion(versionOutput string) (major, minor int, err error) {
+	// Expected format: "tmux 3.6a" or "tmux 3.6"
+	parts := strings.Fields(versionOutput)
+	if len(parts) < 2 || parts[0] != "tmux" {
+		return 0, 0, fmt.Errorf("unexpected format: %q", versionOutput)
+	}
+	ver := parts[1]
+	// Strip trailing letter suffix (e.g. "3.6a" → "3.6")
+	for len(ver) > 0 && ver[len(ver)-1] >= 'a' && ver[len(ver)-1] <= 'z' {
+		ver = ver[:len(ver)-1]
+	}
+	dot := strings.SplitN(ver, ".", 2)
+	if len(dot) != 2 {
+		return 0, 0, fmt.Errorf("no dot in version: %q", ver)
+	}
+	major, err = strconv.Atoi(dot[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad major: %s", err)
+	}
+	minor, err = strconv.Atoi(dot[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad minor: %s", err)
+	}
+	return major, minor, nil
+}
+
+// findRunningTmux checks if the tmux server is running.
+// Returns the binary path if a server responds, empty string if no server.
 func findRunningTmux() string {
+	bin := findTmux()
 	socket := tmuxSocketPath()
-	for _, bin := range tmuxBinaries() {
-		if err := exec.Command(bin, "-S", socket, "list-sessions").Run(); err == nil {
-			return bin
-		}
+	if err := exec.Command(bin, "-S", socket, "list-sessions").Run(); err == nil {
+		return bin
 	}
 	return ""
 }
@@ -394,87 +459,19 @@ func cmdName(name string) {
 	attachSession(resolveAlias(name, readAliases()))
 }
 
-// tmuxBinaries returns tmux paths to check, in preference order.
-// Includes Linuxbrew path if present, then system paths, then PATH lookup.
-func tmuxBinaries() []string {
-	var bins []string
-	// Linuxbrew tmux (newer version, if installed)
-	if _, err := os.Stat("/home/linuxbrew/.linuxbrew/bin/tmux"); err == nil {
-		bins = append(bins, "/home/linuxbrew/.linuxbrew/bin/tmux")
-	}
-	// System tmux
-	if _, err := os.Stat("/usr/bin/tmux"); err == nil {
-		bins = append(bins, "/usr/bin/tmux")
-	}
-	// PATH lookup fallback
-	if p, err := exec.LookPath("tmux"); err == nil {
-		// Avoid duplicates
-		dup := false
-		for _, b := range bins {
-			if b == p {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			bins = append(bins, p)
-		}
-	}
-	return bins
-}
 
 // tmuxSocketPath returns the default tmux socket path for the current user.
 func tmuxSocketPath() string {
 	return fmt.Sprintf("/tmp/tmux-%d/default", os.Getuid())
 }
 
-// getTmuxServerVersion queries the running tmux server version.
-// Returns empty string if no server is running.
-// Strategy: try each binary in tmuxBinaries order until one can talk to the
-// server, then ask the server for its actual version via display-message #{version}.
-func getTmuxServerVersion() string {
-	socket := tmuxSocketPath()
-	for _, bin := range tmuxBinaries() {
-		out, err := exec.Command(bin, "-S", socket, "display-message", "-p", "#{version}").Output()
-		if err == nil {
-			return strings.TrimSpace(string(out))
-		}
-	}
-	return ""
-}
 
-// findTmuxForSession returns the tmux binary to use for the given session.
-// If any tmux server is already running, we must use the system tmux (2.6)
-// because the newer Linuxbrew client can't talk to the older server.
-func findTmuxForSession(name string) string {
-	socket := tmuxSocketPath()
-	bins := tmuxBinaries()
-	sysTmux := bins[len(bins)-1]
-
-	// Check if a server is already running by trying to list sessions with system tmux.
-	// If the command succeeds (exit 0), a server is running and we must use system tmux.
-	// (list-sessions returns exit 1 with "no server running" if no server exists)
-	if _, err := os.Stat(sysTmux); err == nil {
-		if err := exec.Command(sysTmux, "-S", socket, "list-sessions").Run(); err == nil {
-			return sysTmux
-		}
-	}
-
-	// No server running — use preferred binary for fresh start
-	for _, bin := range bins {
-		if _, err := os.Stat(bin); err == nil {
-			return bin
-		}
-	}
-	fatal("no tmux binary found")
-	return ""
-}
 
 // attachSession execs into a tmux session for the given alias.
 func attachSession(a *moshmux.Alias) {
 	dir := expandHome(a.Dir)
 	socket := tmuxSocketPath()
-	tmux := findTmuxForSession(a.Session)
+	tmux := findTmux()
 	if err := syscall.Exec(tmux, []string{"tmux", "-S", socket, "new-session", "-AD", "-s", a.Session, "-c", dir}, os.Environ()); err != nil {
 		fatal("exec tmux: %s", err)
 	}
@@ -561,7 +558,7 @@ func cmdPicker() {
 	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "add .", "", "", "moshmux add . (use cwd)"))
 	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "list", "", "", "moshmux list"))
 	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "join", "", "", "moshmux join <name> (independent windows)"))
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "upgrade", "", "", "moshmux upgrade (kill old tmux 2.6)"))
+	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "upgrade", "", "", "moshmux upgrade (kill stale tmux server)"))
 	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "remove", "", "", "moshmux remove <name>"))
 
 	// Pipe to fzf
@@ -907,33 +904,44 @@ func cmdRemove(name string) {
 	fmt.Printf("Removed %s\n", name)
 }
 
-// cmdUpgrade detects old tmux servers and kills them to allow upgrade.
+// cmdUpgrade detects stale tmux servers (version mismatch) and kills them.
 func cmdUpgrade(force bool) {
-	version := getTmuxServerVersion()
+	bin := findTmux()
+	socket := tmuxSocketPath()
 
-	// No server running
-	if version == "" {
-		fmt.Println("No tmux server running. Next session will use tmux 3.6a ✓")
+	// Get binary version
+	binOut, err := exec.Command(bin, "-V").Output()
+	if err != nil {
+		fatal("could not get tmux version: %s", err)
+	}
+	binVersion := strings.TrimSpace(string(binOut))
+	// Strip "tmux " prefix for display
+	binVersionShort := strings.TrimPrefix(binVersion, "tmux ")
+
+	// Get server version
+	serverOut, err := exec.Command(bin, "-S", socket, "display-message", "-p", "#{version}").Output()
+	if err != nil {
+		fmt.Printf("No tmux server running. Next session will use %s.\n", binVersion)
+		return
+	}
+	serverVersion := strings.TrimSpace(string(serverOut))
+
+	// Compare
+	if serverVersion == binVersionShort {
+		fmt.Printf("Already running tmux %s ✓\n", serverVersion)
 		return
 	}
 
-	// Already on new version
-	if !strings.HasPrefix(version, "2.") {
-		fmt.Printf("Already running tmux %s ✓\n", version)
-		return
-	}
-
-	// Old version detected - warn and prompt
-	fmt.Printf("Old tmux %s detected. Upgrade required.\n\n", version)
+	fmt.Printf("Server running tmux %s, binary is %s.\n\n", serverVersion, binVersionShort)
 
 	aliases := readAliases()
 	sessions := tmuxSessions()
 	rows := buildRows(aliases, sessions)
 
 	// Filter to only show active sessions
-	activeRows := [][]string{}
+	var activeRows [][]string
 	for _, row := range rows {
-		if row[1] != "-" { // status column
+		if row[1] != "-" {
 			activeRows = append(activeRows, row)
 		}
 	}
@@ -947,9 +955,8 @@ func cmdUpgrade(force bool) {
 		fmt.Println()
 	}
 
-	// Prompt for confirmation unless --force
 	if !force {
-		fmt.Print("Kill old server and upgrade to tmux 3.6a? [y/N]: ")
+		fmt.Printf("Kill server and restart with tmux %s? [y/N]: ", binVersionShort)
 		var response string
 		fmt.Scanln(&response)
 		response = strings.ToLower(strings.TrimSpace(response))
@@ -959,14 +966,9 @@ func cmdUpgrade(force bool) {
 		}
 	}
 
-	// Kill the server
-	socket := tmuxSocketPath()
-	// Use the last tmux binary to kill — it can always talk to the old server
-	upgradeBins := tmuxBinaries()
-	if err := exec.Command(upgradeBins[len(upgradeBins)-1], "-S", socket, "kill-server").Run(); err != nil {
+	if err := exec.Command(bin, "-S", socket, "kill-server").Run(); err != nil {
 		fatal("killing tmux server: %s", err)
 	}
 
-	fmt.Println("✓ Old tmux server killed.")
-	fmt.Println("Next moshmux session will use tmux 3.6a")
+	fmt.Printf("✓ Stale tmux server killed. Next session will use tmux %s.\n", binVersionShort)
 }
