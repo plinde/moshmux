@@ -2,9 +2,17 @@
 
 Named tmux session manager with an interactive fzf picker.
 
+## Install
+
+Download a binary from [Releases](https://github.com/plinde/moshmux/releases), or with Go:
+
 ```bash
 go install github.com/plinde/moshmux/cmd/moshmux@latest
+```
 
+## Quick Start
+
+```bash
 cd ~/workspace/myproject
 moshmux add .       # register current directory
 moshmux myproject   # create or reattach to tmux session
