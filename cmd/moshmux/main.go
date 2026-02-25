@@ -19,33 +19,122 @@ import (
 	"github.com/plinde/moshmux"
 )
 
-func repoDir() string {
+// config holds moshmux settings from config.toml.
+type config struct {
+	AliasesDir string // where aliases.toml lives (empty = same as config dir)
+	GitSync    bool   // auto git add/commit/push on alias changes
+}
+
+// configDir returns the XDG config directory for moshmux.
+func configDir() string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "moshmux")
+}
+
+// configPath returns the path to config.toml.
+func configPath() string {
+	return filepath.Join(configDir(), "config.toml")
+}
+
+// loadConfig reads config.toml and returns the parsed config.
+func loadConfig() config {
+	var cfg config
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return cfg
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		val = strings.Trim(val, "\"")
+
+		switch key {
+		case "aliases_dir":
+			cfg.AliasesDir = val
+		case "git_sync":
+			cfg.GitSync = val == "true"
+		}
+	}
+	return cfg
+}
+
+// writeConfig writes the config struct to config.toml.
+func writeConfig(cfg config) {
+	cfgPath := configPath()
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0755); err != nil {
+		fatal("creating config dir: %s", err)
+	}
+	var b strings.Builder
+	if cfg.AliasesDir != "" {
+		fmt.Fprintf(&b, "aliases_dir = \"%s\"\n", cfg.AliasesDir)
+	}
+	if cfg.GitSync {
+		b.WriteString("git_sync = true\n")
+	}
+	if err := os.WriteFile(cfgPath, []byte(b.String()), 0644); err != nil {
+		fatal("writing config: %s", err)
+	}
+}
+
+// aliasesDir returns the directory containing aliases.toml.
+// Priority: MOSHMUX_DIR env > config aliases_dir > XDG config dir.
+func aliasesDir() string {
 	if d := os.Getenv("MOSHMUX_DIR"); d != "" {
 		return d
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "workspace", "moshmux")
+	cfg := loadConfig()
+	if cfg.AliasesDir != "" {
+		return expandHome(cfg.AliasesDir)
+	}
+	return configDir()
 }
 
-func readFile(name string) string {
-	data, err := os.ReadFile(filepath.Join(repoDir(), name))
+// aliasesPath returns the full path to aliases.toml.
+func aliasesPath() string {
+	return filepath.Join(aliasesDir(), "aliases.toml")
+}
+
+// readAliasesFile reads and parses aliases.toml.
+func readAliasesFile() []moshmux.Alias {
+	path := aliasesPath()
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fatal("reading %s: %s", name, err)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		fatal("reading %s: %s", path, err)
 	}
-	return string(data)
+	return moshmux.ParseAliasesToml(string(data))
 }
 
-func writeFile(name, content string) {
-	if err := os.WriteFile(filepath.Join(repoDir(), name), []byte(content), 0644); err != nil {
-		fatal("writing %s: %s", name, err)
+// writeAliasesFile writes aliases to aliases.toml, creating the directory if needed.
+func writeAliasesFile(aliases []moshmux.Alias) {
+	path := aliasesPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		fatal("creating aliases dir: %s", err)
+	}
+	content := moshmux.MarshalAliasesToml(aliases)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		fatal("writing %s: %s", path, err)
 	}
 }
 
-// gitRun executes a git command quietly. Commit shows its summary line,
-// push shows only the "To ..." and ref lines.
-func gitRun(args ...string) {
+// gitRunIn executes a git command in the given directory.
+func gitRunIn(dir string, args ...string) {
 	cmd := exec.Command("git", args...)
-	cmd.Dir = repoDir()
+	cmd.Dir = dir
 	switch args[0] {
 	case "commit":
 		cmd.Stdout = os.Stdout
@@ -68,29 +157,52 @@ func gitRun(args ...string) {
 	}
 }
 
+// syncIfEnabled runs git add/commit/push on aliases.toml if git_sync is enabled
+// and the aliases dir is a git repo.
+func syncIfEnabled(msg string) {
+	cfg := loadConfig()
+	if !cfg.GitSync {
+		return
+	}
+	dir := aliasesDir()
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return
+	}
+	gitRunIn(dir, "add", "aliases.toml")
+	gitRunIn(dir, "commit", "-m", msg)
+	gitRunIn(dir, "push")
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
-  moshmux <name>                Attach to named session
-  moshmux                       Interactive session picker (fzf)
-  moshmux .                     Attach to session matching cwd
-  moshmux list                  Live-updating session status (TUI)
-  moshmux list --no-tui         Print session table and exit
-  moshmux add .                 Add cwd (name = directory basename)
-  moshmux add . <name>          Add cwd with custom alias name
-  moshmux add <name> <target>   Add alias (target = dir or alias name)
-  moshmux remove .              Remove alias matching cwd
-  moshmux remove <name>         Remove <name> alias
-  moshmux update <name> <path>  Update path of existing alias (. = cwd)
-  moshmux kill <name>           Kill named tmux session (alias: close, reset)
-  moshmux termius               Print Termius startup script (fzf picker)
-  moshmux termius <name>        Print Termius startup script (direct attach)
-  moshmux join <name>           Join session with independent window focus
-  moshmux join .                Join session matching cwd
-  moshmux upgrade               Detect and kill old tmux 2.6 server
-  moshmux upgrade --force       Kill old server without confirmation
+  moshmux <name>                  Attach to named session
+  moshmux                         Interactive session picker (fzf)
+  moshmux .                       Attach to session matching cwd
+  moshmux list                    Live-updating session status (TUI)
+  moshmux list --no-tui           Print session table and exit
+  moshmux add .                   Add cwd (name = directory basename)
+  moshmux add . <name>            Add cwd with custom alias name
+  moshmux add <name> <target>     Add alias (target = dir or alias name)
+  moshmux remove .                Remove alias matching cwd
+  moshmux remove <name>           Remove <name> alias
+  moshmux update <name> <path>    Update path of existing alias (. = cwd)
+  moshmux kill <name>             Kill named tmux session (alias: close, reset)
+  moshmux termius                 Print Termius startup script (fzf picker)
+  moshmux termius <name>          Print Termius startup script (direct attach)
+  moshmux join <name>             Join session with independent window focus
+  moshmux join .                  Join session matching cwd
+  moshmux config                  Show current config
+  moshmux config set-aliases-dir  Set aliases directory (. = cwd)
+  moshmux config set-git-sync     Enable/disable git sync (on|off)
+  moshmux migrate [path]          Migrate moshmux.zsh to aliases.toml
+  moshmux upgrade                 Detect and kill old tmux 2.6 server
+  moshmux upgrade --force         Kill old server without confirmation
 `)
 	os.Exit(1)
 }
+
+// Set via -ldflags at build time.
+var version = "dev"
 
 func fatal(msg string, args ...any) {
 	fmt.Fprintf(os.Stderr, "error: "+msg+"\n", args...)
@@ -104,6 +216,9 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "--version", "-v", "version":
+		fmt.Println(version)
+		return
 	case ".":
 		cmdDot()
 	case "list":
@@ -149,6 +264,14 @@ func main() {
 			usage()
 		}
 		cmdKillSession(os.Args[2])
+	case "config":
+		cmdConfig()
+	case "migrate":
+		path := ""
+		if len(os.Args) == 3 {
+			path = os.Args[2]
+		}
+		cmdMigrate(path)
 	case "upgrade":
 		force := len(os.Args) > 2 && os.Args[2] == "--force"
 		cmdUpgrade(force)
@@ -172,7 +295,7 @@ func isPathLike(arg string) bool {
 // Returns (session, dir, error).
 // - If target is path-like, returns (name, target, nil) for default behavior
 // - If target is alias, looks up and returns (alias.Session, alias.Dir, nil)
-func resolveTarget(name, target, zshContent string) (session, dir string, err error) {
+func resolveTarget(name, target string, aliases []moshmux.Alias) (session, dir string, err error) {
 	// Check for self-reference
 	if target == name {
 		return "", "", fmt.Errorf("cannot create alias that references itself")
@@ -184,12 +307,13 @@ func resolveTarget(name, target, zshContent string) (session, dir string, err er
 	}
 
 	// Otherwise, try to resolve as an alias
-	alias, err := moshmux.FindAlias(zshContent, target)
-	if err != nil {
-		return "", "", fmt.Errorf("alias %s not found (did you mean a directory? use ~/path or ./path)", target)
+	for _, a := range aliases {
+		if a.Name == target {
+			return a.Session, a.Dir, nil
+		}
 	}
 
-	return alias.Session, alias.Dir, nil
+	return "", "", fmt.Errorf("alias %s not found (did you mean a directory? use ~/path or ./path)", target)
 }
 
 // handleAdd resolves "moshmux add ." and "moshmux add <name> <target>" forms.
@@ -239,9 +363,9 @@ func cwdTilde() string {
 	return cwd
 }
 
-// readAliases parses moshmux.zsh and returns all configured aliases.
+// readAliases reads aliases from aliases.toml.
 func readAliases() []moshmux.Alias {
-	return moshmux.ParseAliases(readFile("moshmux.zsh"))
+	return readAliasesFile()
 }
 
 // resolveDot resolves "." to an alias via cwd: match by dir path, then by basename.
@@ -322,13 +446,6 @@ func expandHome(path string) string {
 	return path
 }
 
-// gitCommitAndPush stages moshmux.zsh, commits with the given message, and pushes.
-func gitCommitAndPush(msg string) {
-	gitRun("add", "moshmux.zsh")
-	gitRun("commit", "-m", msg)
-	gitRun("push")
-}
-
 // cmdDot attaches to the tmux session matching cwd, or tells the user
 // to register it first. Matches by directory path first, then by name.
 func cmdDot() {
@@ -353,10 +470,7 @@ func cmdTermius(name string) {
 		fmt.Printf("mosh-server new -c 256 -s -l LANG=en_US.UTF-8 -- /usr/bin/env PATH=%s %s\n", moshEnvPath(), self)
 		return
 	}
-	alias, err := moshmux.FindAlias(readFile("moshmux.zsh"), name)
-	if err != nil {
-		fatal("%s", err)
-	}
+	alias := resolveAlias(name, readAliases())
 	fmt.Printf("mosh-server new -c 256 -s -l LANG=en_US.UTF-8 -- /usr/bin/env PATH=%s tmux new-session -A -s '%s' -c '%s'\n", moshEnvPath(), alias.Session, alias.Dir)
 }
 
@@ -528,7 +642,7 @@ func cmdPicker() {
 	sessions := tmuxSessions()
 	aliases = sortAliasesByActivity(aliases, sessions)
 
-	// Compute column width from longest alias name (floor 16, includes command shortcuts)
+	// Compute column width from longest alias name (floor 16)
 	nameWidth := 16
 	for _, a := range aliases {
 		if len(a.Name) > nameWidth {
@@ -539,7 +653,7 @@ func cmdPicker() {
 
 	nameFmt := fmt.Sprintf("%%-%ds", nameWidth)
 
-	// Build lines for fzf: sessions first, then command shortcuts
+	// Build lines for fzf
 	var lines []string
 	for _, a := range aliases {
 		status := "-"
@@ -556,16 +670,9 @@ func cmdPicker() {
 
 		lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", a.Name, status, lastActive, a.Dir))
 	}
-	lines = append(lines, "")
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "add", "", "", "moshmux add <name> <dir>"))
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "add .", "", "", "moshmux add . (use cwd)"))
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "list", "", "", "moshmux list"))
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "join", "", "", "moshmux join <name> (independent windows)"))
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "upgrade", "", "", "moshmux upgrade (kill old tmux 2.6)"))
-	lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", "remove", "", "", "moshmux remove <name>"))
 
 	// Pipe to fzf
-	fzf := exec.Command("fzf", "--prompt=tmux> ", "--reverse", "--header=Sessions ─ select to attach, or see commands below")
+	fzf := exec.Command("fzf", "--prompt=tmux> ", "--reverse", "--header=Sessions ─ select to attach")
 	fzf.Stdin = strings.NewReader(strings.Join(lines, "\n"))
 	fzf.Stderr = os.Stderr
 	out, err := fzf.Output()
@@ -579,47 +686,7 @@ func cmdPicker() {
 	}
 
 	fields := strings.Fields(choice)
-	action := fields[0]
-
-	// Handle command shortcuts
-	switch action {
-	case "add":
-		if len(fields) > 1 && fields[1] == "." {
-			// "add ." shortcut: register cwd using cwd basename as alias name
-			cwd := cwdTilde()
-			name := filepath.Base(cwd)
-			if strings.HasPrefix(cwd, "~") {
-				name = filepath.Base(strings.TrimPrefix(cwd, "~"))
-			}
-			cmdAdd(name, cwd)
-		} else {
-			fmt.Println("Run: moshmux add <name> <dir>")
-		}
-		return
-	case "join":
-		if len(fields) > 1 {
-			cmdJoin(fields[1])
-		} else {
-			fmt.Println("Run: moshmux join <name>")
-		}
-		return
-	case "list":
-		cmdList(true)
-		return
-	case "upgrade":
-		cmdUpgrade(false)
-		return
-	case "remove":
-		if len(fields) > 1 {
-			cmdRemove(fields[1])
-		} else {
-			fmt.Println("Run: moshmux remove <name>")
-		}
-		return
-	}
-
-	// Session selected — attach by name
-	cmdName(action)
+	cmdName(fields[0])
 }
 
 type sessionInfo struct {
@@ -843,21 +910,21 @@ func cmdAdd(name, target string) {
 		fatal("alias name cannot be empty")
 	}
 
-	zshContent := readFile("moshmux.zsh")
+	aliases := readAliases()
 
 	// Resolve target to session and directory
-	session, dir, err := resolveTarget(name, target, zshContent)
+	session, dir, err := resolveTarget(name, target, aliases)
 	if err != nil {
 		fatal("%s", err)
 	}
 
 	// Add the alias
-	newZsh, err := moshmux.AddAliasZshWithSession(zshContent, name, session, dir)
+	aliases, err = moshmux.AddAliasToml(aliases, name, session, dir)
 	if err != nil {
 		fatal("%s", err)
 	}
 
-	writeFile("moshmux.zsh", newZsh)
+	writeAliasesFile(aliases)
 
 	// Determine commit message based on whether it's linking
 	var msg string
@@ -867,7 +934,7 @@ func cmdAdd(name, target string) {
 		msg = fmt.Sprintf("Add %s alias (links to %s session)", name, session)
 	}
 
-	gitCommitAndPush(msg)
+	syncIfEnabled(msg)
 
 	// Show what was created
 	if session == name {
@@ -878,31 +945,31 @@ func cmdAdd(name, target string) {
 }
 
 func cmdUpdate(name, dir string) {
-	zshContent := readFile("moshmux.zsh")
+	aliases := readAliases()
 
-	newZsh, err := moshmux.UpdateAliasZsh(zshContent, name, dir)
+	aliases, err := moshmux.UpdateAliasToml(aliases, name, dir)
 	if err != nil {
 		fatal("%s", err)
 	}
 
-	writeFile("moshmux.zsh", newZsh)
+	writeAliasesFile(aliases)
 
-	gitCommitAndPush(fmt.Sprintf("Update %s path to %s", name, dir))
+	syncIfEnabled(fmt.Sprintf("Update %s path to %s", name, dir))
 
 	fmt.Printf("Updated %s → %s\n", name, dir)
 }
 
 func cmdRemove(name string) {
-	zshContent := readFile("moshmux.zsh")
+	aliases := readAliases()
 
-	newZsh, err := moshmux.RemoveAliasZsh(zshContent, name)
+	aliases, err := moshmux.RemoveAliasToml(aliases, name)
 	if err != nil {
 		fatal("%s", err)
 	}
 
-	writeFile("moshmux.zsh", newZsh)
+	writeAliasesFile(aliases)
 
-	gitCommitAndPush(fmt.Sprintf("Remove %s alias", name))
+	syncIfEnabled(fmt.Sprintf("Remove %s alias", name))
 
 	fmt.Printf("Removed %s\n", name)
 }
@@ -969,4 +1036,113 @@ func cmdUpgrade(force bool) {
 
 	fmt.Println("✓ Old tmux server killed.")
 	fmt.Println("Next moshmux session will use tmux 3.6a")
+}
+
+// cmdConfig shows or modifies moshmux configuration.
+func cmdConfig() {
+	if len(os.Args) == 2 {
+		cfg := loadConfig()
+		fmt.Printf("config:     %s\n", configPath())
+		fmt.Printf("aliases:    %s\n", aliasesPath())
+		if cfg.GitSync {
+			fmt.Printf("git_sync:   on\n")
+		} else {
+			fmt.Printf("git_sync:   off\n")
+		}
+		return
+	}
+
+	if len(os.Args) >= 3 {
+		switch os.Args[2] {
+		case "set-aliases-dir":
+			if len(os.Args) != 4 {
+				fatal("usage: moshmux config set-aliases-dir <path>")
+			}
+			path := os.Args[3]
+			if path == "." {
+				var err error
+				path, err = os.Getwd()
+				if err != nil {
+					fatal("getting cwd: %s", err)
+				}
+			} else {
+				path = expandHome(path)
+			}
+
+			info, err := os.Stat(path)
+			if err != nil || !info.IsDir() {
+				fatal("%s is not a directory", path)
+			}
+
+			cfg := loadConfig()
+			cfg.AliasesDir = path
+			writeConfig(cfg)
+
+			fmt.Printf("aliases_dir = %s\n", path)
+			fmt.Printf("  → %s\n", configPath())
+			return
+
+		case "set-git-sync":
+			if len(os.Args) != 4 {
+				fatal("usage: moshmux config set-git-sync on|off")
+			}
+			val := os.Args[3]
+			cfg := loadConfig()
+			switch val {
+			case "on", "true":
+				cfg.GitSync = true
+			case "off", "false":
+				cfg.GitSync = false
+			default:
+				fatal("expected on or off, got %q", val)
+			}
+			writeConfig(cfg)
+			fmt.Printf("git_sync = %v\n", cfg.GitSync)
+			return
+		}
+	}
+
+	usage()
+}
+
+// cmdMigrate converts moshmux.zsh to aliases.toml.
+func cmdMigrate(zshPath string) {
+	if zshPath == "" {
+		candidates := []string{
+			filepath.Join(aliasesDir(), "moshmux.zsh"),
+		}
+		home, _ := os.UserHomeDir()
+		candidates = append(candidates, filepath.Join(home, "workspace", "moshmux", "moshmux.zsh"))
+
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				zshPath = c
+				break
+			}
+		}
+		if zshPath == "" {
+			fatal("no moshmux.zsh found; pass path as argument: moshmux migrate /path/to/moshmux.zsh")
+		}
+	} else {
+		zshPath = expandHome(zshPath)
+	}
+
+	if _, err := os.Stat(aliasesPath()); err == nil {
+		fatal("aliases.toml already exists at %s; remove it first to re-migrate", aliasesPath())
+	}
+
+	data, err := os.ReadFile(zshPath)
+	if err != nil {
+		fatal("reading %s: %s", zshPath, err)
+	}
+
+	aliases := moshmux.ParseAliases(string(data))
+	if len(aliases) == 0 {
+		fatal("no aliases found in %s", zshPath)
+	}
+
+	writeAliasesFile(aliases)
+
+	fmt.Printf("Migrated %d aliases from %s\n", len(aliases), zshPath)
+	fmt.Printf("  → %s\n", aliasesPath())
 }

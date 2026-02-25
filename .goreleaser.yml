@@ -3,6 +3,8 @@ project_name: moshmux
 builds:
   - main: ./cmd/moshmux
     binary: moshmux
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
     env:
       - CGO_ENABLED=0
     goos:
