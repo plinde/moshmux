@@ -4,220 +4,143 @@ import (
 	"testing"
 )
 
-func TestParseAliases(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  []Alias
-	}{
-		{
-			name:  "single alias",
-			input: "alias mc='mux minecraft ~/workspace/minecraft'",
-			want:  []Alias{{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"}},
-		},
-		{
-			name:  "multiple aliases",
-			input: "alias mc='mux minecraft ~/workspace/minecraft'\nalias dev='mux dev ~/workspace/dev'",
-			want: []Alias{
-				{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"},
-				{Name: "dev", Session: "dev", Dir: "~/workspace/dev"},
-			},
-		},
-		{
-			name:  "empty input",
-			input: "",
-			want:  nil,
-		},
-		{
-			name:  "non-alias lines ignored",
-			input: "# comment\nexport FOO=bar\nalias mc='mux minecraft ~/workspace/minecraft'\nsome other line",
-			want:  []Alias{{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"}},
-		},
-		{
-			name:  "non-mux alias ignored",
-			input: "alias ll='ls -la'",
-			want:  nil,
-		},
-		{
-			name:  "double-quoted value",
-			input: `alias mc="mux minecraft ~/workspace/minecraft"`,
-			want:  []Alias{{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"}},
-		},
-		{
-			name:  "malformed no equals",
-			input: "alias mc mux minecraft ~/workspace/minecraft",
-			want:  nil,
-		},
-		{
-			name:  "mux with only two parts",
-			input: "alias mc='mux minecraft'",
-			want:  nil,
-		},
-		{
-			name:  "dir with spaces in path",
-			input: "alias mc='mux minecraft ~/workspace/my project dir'",
-			want:  []Alias{{Name: "mc", Session: "minecraft", Dir: "~/workspace/my project dir"}},
-		},
+func TestParseAliasesToml(t *testing.T) {
+	content := `[mc]
+session = "minecraft"
+dir = "~/workspace/minecraft"
+
+[moshmux]
+dir = "~/workspace/moshmux"
+
+# Comment line
+[asm]
+dir = "~/workspace/github.com/plinde/agent-skill-manager"
+`
+
+	aliases := ParseAliasesToml(content)
+	if len(aliases) != 3 {
+		t.Fatalf("expected 3 aliases, got %d", len(aliases))
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ParseAliases(tt.input)
-			if len(got) != len(tt.want) {
-				t.Fatalf("ParseAliases() returned %d aliases, want %d", len(got), len(tt.want))
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("alias[%d] = %+v, want %+v", i, got[i], tt.want[i])
-				}
-			}
-		})
+	// mc: explicit session
+	if aliases[0].Name != "mc" || aliases[0].Session != "minecraft" || aliases[0].Dir != "~/workspace/minecraft" {
+		t.Errorf("mc alias: got %+v", aliases[0])
+	}
+
+	// moshmux: session defaults to name
+	if aliases[1].Name != "moshmux" || aliases[1].Session != "moshmux" || aliases[1].Dir != "~/workspace/moshmux" {
+		t.Errorf("moshmux alias: got %+v", aliases[1])
+	}
+
+	// asm: session defaults to name
+	if aliases[2].Name != "asm" || aliases[2].Session != "asm" {
+		t.Errorf("asm alias: got %+v", aliases[2])
 	}
 }
 
-func TestFindAlias(t *testing.T) {
-	content := "alias mc='mux minecraft ~/workspace/minecraft'\nalias dev='mux dev ~/workspace/dev'"
+func TestMarshalAliasesToml(t *testing.T) {
+	aliases := []Alias{
+		{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"},
+		{Name: "moshmux", Session: "moshmux", Dir: "~/workspace/moshmux"},
+	}
 
-	t.Run("found", func(t *testing.T) {
-		a, err := FindAlias(content, "mc")
-		if err != nil {
-			t.Fatalf("FindAlias() error = %v", err)
-		}
-		if a.Name != "mc" || a.Session != "minecraft" || a.Dir != "~/workspace/minecraft" {
-			t.Errorf("FindAlias() = %+v", a)
-		}
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		_, err := FindAlias(content, "nonexistent")
-		if err == nil {
-			t.Fatal("FindAlias() expected error for missing alias")
-		}
-	})
+	got := MarshalAliasesToml(aliases)
+	expected := "[mc]\nsession = \"minecraft\"\ndir = \"~/workspace/minecraft\"\n\n[moshmux]\ndir = \"~/workspace/moshmux\"\n"
+	if got != expected {
+		t.Errorf("marshal mismatch:\ngot:\n%s\nexpected:\n%s", got, expected)
+	}
 }
 
-func TestAddAliasZshWithSession(t *testing.T) {
-	base := "alias mc='mux minecraft ~/workspace/minecraft'\n"
+func TestMarshalRoundTrip(t *testing.T) {
+	original := []Alias{
+		{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"},
+		{Name: "moshmux", Session: "moshmux", Dir: "~/workspace/moshmux"},
+		{Name: "asm", Session: "asm", Dir: "~/workspace/github.com/plinde/asm"},
+	}
 
-	t.Run("success", func(t *testing.T) {
-		got, err := AddAliasZshWithSession(base, "dev", "dev", "~/workspace/dev")
-		if err != nil {
-			t.Fatalf("AddAliasZshWithSession() error = %v", err)
-		}
-		aliases := ParseAliases(got)
-		if len(aliases) != 2 {
-			t.Fatalf("expected 2 aliases, got %d", len(aliases))
-		}
-		if aliases[1].Name != "dev" || aliases[1].Session != "dev" || aliases[1].Dir != "~/workspace/dev" {
-			t.Errorf("new alias = %+v", aliases[1])
-		}
-	})
+	content := MarshalAliasesToml(original)
+	parsed := ParseAliasesToml(content)
 
-	t.Run("duplicate error", func(t *testing.T) {
-		_, err := AddAliasZshWithSession(base, "mc", "minecraft", "~/workspace/minecraft")
-		if err == nil {
-			t.Fatal("expected error for duplicate alias")
-		}
-	})
-
-	t.Run("preserves existing", func(t *testing.T) {
-		got, err := AddAliasZshWithSession(base, "new", "newsess", "~/workspace/new")
-		if err != nil {
-			t.Fatalf("AddAliasZshWithSession() error = %v", err)
-		}
-		aliases := ParseAliases(got)
-		if aliases[0].Name != "mc" {
-			t.Errorf("existing alias modified: %+v", aliases[0])
-		}
-	})
-}
-
-func TestUpdateAliasZsh(t *testing.T) {
-	base := "alias mc='mux minecraft ~/workspace/minecraft'\nalias dev='mux dev ~/workspace/dev'\n"
-
-	t.Run("success", func(t *testing.T) {
-		got, err := UpdateAliasZsh(base, "mc", "~/workspace/minecraft-new")
-		if err != nil {
-			t.Fatalf("UpdateAliasZsh() error = %v", err)
-		}
-		a, err := FindAlias(got, "mc")
-		if err != nil {
-			t.Fatalf("FindAlias() error = %v", err)
-		}
-		if a.Dir != "~/workspace/minecraft-new" {
-			t.Errorf("dir = %q, want ~/workspace/minecraft-new", a.Dir)
-		}
-	})
-
-	t.Run("preserves session name", func(t *testing.T) {
-		got, err := UpdateAliasZsh(base, "mc", "~/workspace/other")
-		if err != nil {
-			t.Fatalf("UpdateAliasZsh() error = %v", err)
-		}
-		a, _ := FindAlias(got, "mc")
-		if a.Session != "minecraft" {
-			t.Errorf("session = %q, want minecraft", a.Session)
-		}
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		_, err := UpdateAliasZsh(base, "nonexistent", "~/workspace/x")
-		if err == nil {
-			t.Fatal("expected error for missing alias")
-		}
-	})
-}
-
-func TestRemoveAliasZsh(t *testing.T) {
-	base := "alias mc='mux minecraft ~/workspace/minecraft'\nalias dev='mux dev ~/workspace/dev'\n"
-
-	t.Run("success", func(t *testing.T) {
-		got, err := RemoveAliasZsh(base, "mc")
-		if err != nil {
-			t.Fatalf("RemoveAliasZsh() error = %v", err)
-		}
-		aliases := ParseAliases(got)
-		if len(aliases) != 1 {
-			t.Fatalf("expected 1 alias, got %d", len(aliases))
-		}
-		if aliases[0].Name != "dev" {
-			t.Errorf("wrong alias remaining: %+v", aliases[0])
-		}
-	})
-
-	t.Run("not found", func(t *testing.T) {
-		_, err := RemoveAliasZsh(base, "nonexistent")
-		if err == nil {
-			t.Fatal("expected error for missing alias")
-		}
-	})
-
-	t.Run("preserves other lines", func(t *testing.T) {
-		input := "# header\nalias mc='mux minecraft ~/workspace/minecraft'\nalias dev='mux dev ~/workspace/dev'\n# footer\n"
-		got, err := RemoveAliasZsh(input, "mc")
-		if err != nil {
-			t.Fatalf("RemoveAliasZsh() error = %v", err)
-		}
-		aliases := ParseAliases(got)
-		if len(aliases) != 1 || aliases[0].Name != "dev" {
-			t.Fatalf("unexpected aliases: %+v", aliases)
-		}
-		// Verify non-alias lines preserved
-		if !contains(got, "# header") || !contains(got, "# footer") {
-			t.Error("non-alias lines were not preserved")
-		}
-	})
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
+	if len(parsed) != len(original) {
+		t.Fatalf("roundtrip: expected %d aliases, got %d", len(original), len(parsed))
+	}
+	for i := range original {
+		if parsed[i] != original[i] {
+			t.Errorf("roundtrip[%d]: got %+v, want %+v", i, parsed[i], original[i])
 		}
 	}
-	return false
+}
+
+func TestAddAliasToml(t *testing.T) {
+	aliases := []Alias{{Name: "mc", Session: "minecraft", Dir: "~/mc"}}
+
+	got, err := AddAliasToml(aliases, "test", "test", "~/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Name != "test" {
+		t.Errorf("expected 2 aliases, got %d", len(got))
+	}
+
+	_, err = AddAliasToml(got, "mc", "mc", "~/mc2")
+	if err == nil {
+		t.Error("expected duplicate error")
+	}
+}
+
+func TestUpdateAliasToml(t *testing.T) {
+	aliases := []Alias{{Name: "mc", Session: "minecraft", Dir: "~/mc"}}
+
+	got, err := UpdateAliasToml(aliases, "mc", "~/new-mc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Dir != "~/new-mc" {
+		t.Errorf("expected ~/new-mc, got %s", got[0].Dir)
+	}
+
+	_, err = UpdateAliasToml(aliases, "nope", "~/x")
+	if err == nil {
+		t.Error("expected not found error")
+	}
+}
+
+func TestRemoveAliasToml(t *testing.T) {
+	aliases := []Alias{
+		{Name: "mc", Session: "minecraft", Dir: "~/mc"},
+		{Name: "test", Session: "test", Dir: "~/test"},
+	}
+
+	got, err := RemoveAliasToml(aliases, "mc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "test" {
+		t.Errorf("expected [test], got %+v", got)
+	}
+
+	_, err = RemoveAliasToml(got, "mc")
+	if err == nil {
+		t.Error("expected not found error")
+	}
+}
+
+func TestParseZshAndMarshalToml(t *testing.T) {
+	zsh := "alias mc='mux minecraft ~/workspace/minecraft'\nalias moshmux='mux moshmux ~/workspace/moshmux'\nalias asm='mux asm ~/workspace/github.com/plinde/asm'\n"
+	aliases := ParseAliases(zsh)
+	if len(aliases) != 3 {
+		t.Fatalf("expected 3 zsh aliases, got %d", len(aliases))
+	}
+
+	toml := MarshalAliasesToml(aliases)
+	parsed := ParseAliasesToml(toml)
+	if len(parsed) != 3 {
+		t.Fatalf("expected 3 toml aliases after roundtrip, got %d", len(parsed))
+	}
+
+	for i := range aliases {
+		if aliases[i] != parsed[i] {
+			t.Errorf("[%d] zsh=%+v toml=%+v", i, aliases[i], parsed[i])
+		}
+	}
 }

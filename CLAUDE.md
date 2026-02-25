@@ -2,13 +2,43 @@
 
 ## Project Overview
 
-Named tmux session manager with shell aliases and an interactive fzf-based session picker. Works locally by default; set `MOSHMUX_HOST` for remote SSH/mosh usage.
+Named tmux session manager with TOML-based alias config and an interactive fzf-based session picker. Works locally by default; set `MOSHMUX_HOST` for remote SSH/mosh usage.
 
 ## Key Files
 
-- `moshmux.zsh` — Shell aliases file. Contains the `mux()` function and all aliases. Sourced from `~/.zshrc`.
 - `cmd/moshmux/main.go` — CLI binary for managing aliases and launching sessions via fzf.
-- `parser.go` — Library for parsing/editing `moshmux.zsh` alias entries.
+- `parser.go` — Library for parsing/editing alias entries (TOML format, with legacy zsh parser for migration).
+
+## Config Layout
+
+```
+~/.config/moshmux/
+  config.toml       — settings (aliases_dir, git_sync)
+  aliases.toml      — default aliases location
+```
+
+### config.toml
+
+```toml
+# Optional: where aliases.toml lives. Default = same dir as config.toml.
+# aliases_dir = "/home/user/workspace/moshmux-config"
+
+# Auto git add/commit/push on alias changes. Default = false.
+# git_sync = false
+```
+
+### aliases.toml
+
+```toml
+[mc]
+session = "minecraft"
+dir = "~/workspace/minecraft"
+
+[moshmux]
+dir = "~/workspace/moshmux"
+
+# When session is omitted, defaults to the alias (section) name
+```
 
 ## Usage
 
@@ -26,6 +56,10 @@ moshmux join <name>           Join session with independent window focus
 moshmux join .                Join session matching cwd
 moshmux kill <name>           Kill named tmux session
 moshmux termius               Print Termius startup script
+moshmux config                Show current config
+moshmux config set-aliases-dir  Set aliases directory
+moshmux config set-git-sync   Enable/disable git sync (on|off)
+moshmux migrate [path]        Migrate moshmux.zsh to aliases.toml
 moshmux upgrade               Detect and kill old tmux server
 ```
 
@@ -38,10 +72,18 @@ moshmux add myproject ~/workspace/myproject
 moshmux add .   # uses cwd basename as name
 ```
 
-Or manually add to `moshmux.zsh`:
+Or manually edit `~/.config/moshmux/aliases.toml`:
+
+```toml
+[myproject]
+dir = "~/workspace/myproject"
+```
+
+## Migration from moshmux.zsh
 
 ```bash
-alias name='mux name ~/workspace/project-dir'
+moshmux migrate                          # auto-detect moshmux.zsh
+moshmux migrate ~/workspace/moshmux/moshmux.zsh  # explicit path
 ```
 
 ## Build
@@ -52,6 +94,7 @@ go build -o moshmux ./cmd/moshmux
 
 ## Notes
 
-- `moshmux.zsh` should be POSIX/zsh compatible (sourced on various platforms)
+- Aliases dir resolution: `MOSHMUX_DIR` env > `aliases_dir` in config.toml > `~/.config/moshmux/`
+- Git sync is opt-in: set `git_sync = true` in config.toml and ensure aliases dir is a git repo
 - Local mode (default): `mux()` runs tmux directly
 - Remote mode: `export MOSHMUX_HOST=server` makes `mux()` use SSH/mosh
