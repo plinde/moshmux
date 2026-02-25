@@ -14,7 +14,7 @@ dir = "~/workspace/moshmux"
 
 # Comment line
 [asm]
-dir = "~/workspace/github.com/plinde/agent-skill-manager"
+dir = "~/workspace/mytools"
 `
 
 	aliases := ParseAliasesToml(content)
@@ -55,7 +55,7 @@ func TestMarshalRoundTrip(t *testing.T) {
 	original := []Alias{
 		{Name: "mc", Session: "minecraft", Dir: "~/workspace/minecraft"},
 		{Name: "moshmux", Session: "moshmux", Dir: "~/workspace/moshmux"},
-		{Name: "asm", Session: "asm", Dir: "~/workspace/github.com/plinde/asm"},
+		{Name: "asm", Session: "asm", Dir: "~/workspace/mytools"},
 	}
 
 	content := MarshalAliasesToml(original)
@@ -126,7 +126,7 @@ func TestRemoveAliasToml(t *testing.T) {
 }
 
 func TestParseZshAndMarshalToml(t *testing.T) {
-	zsh := "alias mc='mux minecraft ~/workspace/minecraft'\nalias moshmux='mux moshmux ~/workspace/moshmux'\nalias asm='mux asm ~/workspace/github.com/plinde/asm'\n"
+	zsh := "alias mc='mux minecraft ~/workspace/minecraft'\nalias moshmux='mux moshmux ~/workspace/moshmux'\nalias asm='mux asm ~/workspace/mytools'\n"
 	aliases := ParseAliases(zsh)
 	if len(aliases) != 3 {
 		t.Fatalf("expected 3 zsh aliases, got %d", len(aliases))
