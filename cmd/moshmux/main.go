@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -195,6 +198,9 @@ func usage() {
   moshmux config set-aliases-dir  Set aliases directory (. = cwd)
   moshmux config set-git-sync     Enable/disable git sync (on|off)
   moshmux migrate [path]          Migrate moshmux.zsh to aliases.toml
+  moshmux suggest                 Suggest aliases from zoxide/atuin/history
+  moshmux suggest --source zoxide Only use zoxide as source
+  moshmux suggest --count 15      Show top 15 suggestions (default: 10)
   moshmux upgrade                 Detect and kill old tmux 2.6 server
   moshmux upgrade --force         Kill old server without confirmation
 `)
@@ -275,6 +281,24 @@ func main() {
 	case "upgrade":
 		force := len(os.Args) > 2 && os.Args[2] == "--force"
 		cmdUpgrade(force)
+	case "suggest":
+		var sources []string
+		count := 10
+		for i := 2; i < len(os.Args); i++ {
+			switch os.Args[i] {
+			case "--source":
+				i++
+				if i < len(os.Args) {
+					sources = append(sources, os.Args[i])
+				}
+			case "--count":
+				i++
+				if i < len(os.Args) {
+					count, _ = strconv.Atoi(os.Args[i])
+				}
+			}
+		}
+		cmdSuggest(sources, count)
 	default:
 		if len(os.Args) == 2 {
 			cmdName(os.Args[1])
@@ -301,8 +325,15 @@ func resolveTarget(name, target string, aliases []moshmux.Alias) (session, dir s
 		return "", "", fmt.Errorf("cannot create alias that references itself")
 	}
 
-	// If it looks like a path, use it as-is (default behavior)
+	// If it looks like a path, check if an existing alias already uses this directory
 	if isPathLike(target) {
+		normalizedTarget := pathToTilde(expandHome(target))
+		for _, a := range aliases {
+			normalizedExisting := pathToTilde(expandHome(a.Dir))
+			if normalizedExisting == normalizedTarget {
+				return a.Session, normalizedTarget, nil
+			}
+		}
 		return name, target, nil
 	}
 
@@ -643,10 +674,15 @@ func cmdPicker() {
 	aliases = sortAliasesByActivity(aliases, sessions)
 
 	// Compute column width from longest alias name (floor 16)
+	// Account for "* " prefix on non-canonical aliases
 	nameWidth := 16
 	for _, a := range aliases {
-		if len(a.Name) > nameWidth {
-			nameWidth = len(a.Name)
+		w := len(a.Name)
+		if a.Session != a.Name {
+			w += 2 // "* " prefix
+		}
+		if w > nameWidth {
+			nameWidth = w
 		}
 	}
 	nameWidth++ // one space padding
@@ -668,7 +704,12 @@ func cmdPicker() {
 			lastActive = formatRelativeTime(info.activity)
 		}
 
-		lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", a.Name, status, lastActive, a.Dir))
+		displayName := a.Name
+		if a.Session != a.Name {
+			displayName = "* " + a.Name
+		}
+
+		lines = append(lines, fmt.Sprintf(nameFmt+"%-10s %-10s %s", displayName, status, lastActive, a.Dir))
 	}
 
 	// Pipe to fzf
@@ -686,7 +727,11 @@ func cmdPicker() {
 	}
 
 	fields := strings.Fields(choice)
-	cmdName(fields[0])
+	name := fields[0]
+	if name == "*" && len(fields) > 1 {
+		name = fields[1]
+	}
+	cmdName(name)
 }
 
 type sessionInfo struct {
@@ -843,8 +888,13 @@ func buildRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][]str
 			lastActive = formatRelativeTime(info.activity)
 		}
 
+		displayName := a.Name
+		if a.Session != a.Name {
+			displayName = "* " + a.Name
+		}
+
 		rows = append(rows, []string{
-			a.Name,
+			displayName,
 			status,
 			lastActive,
 			a.Dir,
@@ -1103,6 +1153,429 @@ func cmdConfig() {
 	}
 
 	usage()
+}
+
+// pathToTilde converts an absolute path to tilde form (~/ prefix).
+func pathToTilde(path string) string {
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(path, home) {
+		return "~" + strings.TrimPrefix(path, home)
+	}
+	return path
+}
+
+// isSystemPath returns true for paths that shouldn't be suggested as aliases.
+func isSystemPath(dir string) bool {
+	expanded := expandHome(dir)
+	home, _ := os.UserHomeDir()
+
+	// Exclude home dir root itself
+	if expanded == home {
+		return true
+	}
+
+	systemPrefixes := []string{"/tmp", "/var", "/etc", "/usr", "/proc", "/sys", "/dev", "/run"}
+	for _, prefix := range systemPrefixes {
+		if strings.HasPrefix(expanded, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectZoxide returns directory scores from zoxide.
+func collectZoxide() map[string]int {
+	out, err := exec.Command("zoxide", "query", "-ls").Output()
+	if err != nil {
+		return nil
+	}
+	scores := make(map[string]int)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: "  123.4 /home/user/workspace/foo"
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		score, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		if err != nil {
+			continue
+		}
+		dir := strings.TrimSpace(parts[1])
+		dir = pathToTilde(dir)
+		scores[dir] = int(math.Round(score))
+	}
+	return scores
+}
+
+// parseCdCommands extracts directory paths from cd/z commands in history lines.
+func parseCdCommands(lines []string) map[string]int {
+	counts := make(map[string]int)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var dir string
+		if strings.HasPrefix(line, "cd ") {
+			dir = strings.TrimSpace(strings.TrimPrefix(line, "cd "))
+		} else if strings.HasPrefix(line, "z ") {
+			dir = strings.TrimSpace(strings.TrimPrefix(line, "z "))
+		} else {
+			continue
+		}
+
+		// Skip relative navigation
+		if dir == "" || dir == ".." || dir == "-" || dir == "." {
+			continue
+		}
+
+		// Strip surrounding quotes
+		dir = strings.Trim(dir, "'\"")
+
+		// Expand ~ to absolute for existence check, then back to tilde
+		expanded := expandHome(dir)
+		dir = pathToTilde(expanded)
+
+		counts[dir]++
+	}
+	return counts
+}
+
+// collectAtuin returns directory frequency counts from atuin history.
+func collectAtuin() map[string]int {
+	out, err := exec.Command("atuin", "history", "list", "--cmd-only").Output()
+	if err != nil {
+		return nil
+	}
+	return parseCdCommands(strings.Split(string(out), "\n"))
+}
+
+// collectZshHistory returns directory frequency counts from zsh history file.
+func collectZshHistory() map[string]int {
+	histfile := os.Getenv("HISTFILE")
+	if histfile == "" {
+		histfile = expandHome("~/.zsh_history")
+	}
+
+	f, err := os.Open(histfile)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// zsh extended history format: ": timestamp:0;command"
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	// Increase buffer for long history lines
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Strip zsh extended history prefix
+		if idx := strings.Index(line, ";"); idx >= 0 && strings.HasPrefix(line, ": ") {
+			line = line[idx+1:]
+		}
+		lines = append(lines, line)
+	}
+	return parseCdCommands(lines)
+}
+
+// collectShellAliases returns a map of dir → preferred alias name from shell aliases.
+func collectShellAliases() map[string]string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/zsh"
+	}
+
+	out, err := exec.Command(shell, "-ic", "alias").Output()
+	if err != nil {
+		return nil
+	}
+
+	// Match: name='cd ~/path' or name='z ~/path' or name='builtin cd ~/path'
+	re := regexp.MustCompile(`^(\S+)='(?:builtin\s+)?(?:cd|z)\s+(.+?)'$`)
+
+	result := make(map[string]string)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		m := re.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		name := m[1]
+		dir := strings.TrimSpace(m[2])
+		dir = strings.Trim(dir, "'\"")
+		expanded := expandHome(dir)
+		dir = pathToTilde(expanded)
+		result[dir] = name
+	}
+	return result
+}
+
+// suggestCandidate represents a directory that could be added as an alias.
+type suggestCandidate struct {
+	Dir    string
+	Alias  string
+	Score  int
+	Source string // e.g. "zoxide", "zoxide+alias", "atuin"
+}
+
+// cmdSuggest scans configured sources and suggests aliases to add.
+func cmdSuggest(sources []string, count int) {
+	if count <= 0 {
+		count = 10
+	}
+
+	// Determine which sources to use
+	allSources := len(sources) == 0
+	useSource := func(name string) bool {
+		if allSources {
+			return true
+		}
+		for _, s := range sources {
+			if s == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Collect scores from each source
+	dirScores := make(map[string]int)
+	dirSources := make(map[string][]string) // track which sources contributed
+
+	var scannedSources []string
+
+	if useSource("zoxide") {
+		if _, err := exec.LookPath("zoxide"); err == nil {
+			scannedSources = append(scannedSources, "zoxide")
+			if scores := collectZoxide(); scores != nil {
+				for dir, score := range scores {
+					dirScores[dir] += score
+					dirSources[dir] = append(dirSources[dir], "zoxide")
+				}
+			}
+		}
+	}
+
+	if useSource("atuin") {
+		if _, err := exec.LookPath("atuin"); err == nil {
+			scannedSources = append(scannedSources, "atuin")
+			if scores := collectAtuin(); scores != nil {
+				for dir, score := range scores {
+					dirScores[dir] += score
+					dirSources[dir] = append(dirSources[dir], "atuin")
+				}
+			}
+		}
+	}
+
+	if useSource("history") {
+		histfile := os.Getenv("HISTFILE")
+		if histfile == "" {
+			histfile = expandHome("~/.zsh_history")
+		}
+		if _, err := os.Stat(histfile); err == nil {
+			scannedSources = append(scannedSources, "history")
+			if scores := collectZshHistory(); scores != nil {
+				for dir, score := range scores {
+					dirScores[dir] += score
+					dirSources[dir] = append(dirSources[dir], "history")
+				}
+			}
+		}
+	}
+
+	// Shell aliases — always check for name hints
+	aliasHints := make(map[string]string)
+	if useSource("aliases") || allSources {
+		if hints := collectShellAliases(); hints != nil {
+			if useSource("aliases") || allSources {
+				scannedSources = append(scannedSources, "shell aliases")
+			}
+			for dir, name := range hints {
+				aliasHints[dir] = name
+				// Shell aliases with no score from other sources get a base score of 1
+				if dirScores[dir] == 0 {
+					dirScores[dir] = 1
+				}
+				if _, found := dirSources[dir]; !found {
+					dirSources[dir] = []string{"alias"}
+				}
+			}
+		}
+	}
+
+	if len(scannedSources) == 0 {
+		fmt.Fprintln(os.Stderr, "No directory sources found (install zoxide or atuin, or check zsh history)")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Scanning: %s\n\n", strings.Join(scannedSources, ", "))
+
+	// Load existing aliases to filter out
+	existingAliases := readAliases()
+	existingDirs := make(map[string]bool)
+	existingNames := make(map[string]bool)
+	for _, a := range existingAliases {
+		existingDirs[a.Dir] = true
+		existingNames[a.Name] = true
+	}
+
+	// Build candidates
+	type scored struct {
+		dir   string
+		score int
+	}
+	var sorted []scored
+	for dir, score := range dirScores {
+		sorted = append(sorted, scored{dir, score})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].score > sorted[j].score
+	})
+
+	var candidates []suggestCandidate
+	for _, s := range sorted {
+		if len(candidates) >= count {
+			break
+		}
+
+		dir := s.dir
+
+		// Filter: already aliased
+		if existingDirs[dir] {
+			continue
+		}
+
+		// Filter: system path
+		if isSystemPath(dir) {
+			continue
+		}
+
+		// Filter: doesn't exist on disk
+		expanded := expandHome(dir)
+		if info, err := os.Stat(expanded); err != nil || !info.IsDir() {
+			continue
+		}
+
+		// Determine alias name
+		name := filepath.Base(expanded)
+		srcLabel := strings.Join(dirSources[dir], "+")
+		if hint, ok := aliasHints[dir]; ok {
+			name = hint
+			if !strings.Contains(srcLabel, "alias") {
+				srcLabel += "+alias"
+			}
+		}
+
+		// Skip if name conflicts with existing alias
+		if existingNames[name] {
+			continue
+		}
+
+		candidates = append(candidates, suggestCandidate{
+			Dir:    dir,
+			Alias:  name,
+			Score:  s.score,
+			Source: srcLabel,
+		})
+	}
+
+	if len(candidates) == 0 {
+		fmt.Println("No suggestions — all hotspot directories are already aliased!")
+		return
+	}
+
+	// Print table
+	dim := lipgloss.NewStyle().Faint(true)
+	rows := make([][]string, len(candidates))
+	for i, c := range candidates {
+		rows[i] = []string{
+			fmt.Sprintf("%d", i+1),
+			fmt.Sprintf("%d", c.Score),
+			c.Alias,
+			c.Dir,
+			c.Source,
+		}
+	}
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(dim).
+		Headers("#", "SCORE", "ALIAS", "DIR", "SOURCE").
+		StyleFunc(func(row, col int) lipgloss.Style {
+			if row == table.HeaderRow {
+				return lipgloss.NewStyle().Bold(true)
+			}
+			return lipgloss.NewStyle()
+		}).
+		Rows(rows...)
+	fmt.Println(t.String())
+
+	// Check if fzf is available and stdout is a terminal
+	if _, err := exec.LookPath("fzf"); err != nil {
+		return
+	}
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return
+	}
+
+	// Build fzf input lines
+	var fzfLines []string
+	for _, c := range candidates {
+		fzfLines = append(fzfLines, fmt.Sprintf("%-16s %s", c.Alias, c.Dir))
+	}
+
+	fzf := exec.Command("fzf", "--multi", "--prompt=Add aliases> ", "--reverse",
+		"--header=Tab to select, Enter to confirm")
+	fzf.Stdin = strings.NewReader(strings.Join(fzfLines, "\n"))
+	fzf.Stderr = os.Stderr
+	out, err := fzf.Output()
+	if err != nil {
+		return // user cancelled
+	}
+
+	selected := strings.TrimSpace(string(out))
+	if selected == "" {
+		return
+	}
+
+	// Parse selections and add aliases
+	aliases := readAliases()
+	for _, line := range strings.Split(selected, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		dir := fields[1]
+
+		// Check if an existing alias already uses this directory
+		session, resolvedDir, resolveErr := resolveTarget(name, dir, aliases)
+		if resolveErr != nil {
+			fmt.Fprintf(os.Stderr, "skip %s: %s\n", name, resolveErr)
+			continue
+		}
+
+		var addErr error
+		aliases, addErr = moshmux.AddAliasToml(aliases, name, session, resolvedDir)
+		if addErr != nil {
+			fmt.Fprintf(os.Stderr, "skip %s: %s\n", name, addErr)
+			continue
+		}
+		if session == name {
+			fmt.Printf("Added %s → %s\n", name, resolvedDir)
+		} else {
+			fmt.Printf("Added %s → %s session (%s)\n", name, session, resolvedDir)
+		}
+	}
+
+	writeAliasesFile(aliases)
+	syncIfEnabled("Add suggested aliases")
 }
 
 // cmdMigrate converts moshmux.zsh to aliases.toml.
