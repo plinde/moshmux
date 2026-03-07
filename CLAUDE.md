@@ -59,6 +59,9 @@ moshmux termius               Print Termius startup script
 moshmux config                Show current config
 moshmux config set-aliases-dir  Set aliases directory
 moshmux config set-git-sync   Enable/disable git sync (on|off)
+moshmux suggest               Suggest aliases from zoxide/atuin/history
+moshmux suggest --source X    Only use specific source (zoxide|atuin|history|aliases)
+moshmux suggest --count N     Show top N suggestions (default: 10)
 moshmux migrate [path]        Migrate moshmux.zsh to aliases.toml
 moshmux upgrade               Detect and kill old tmux server
 ```
