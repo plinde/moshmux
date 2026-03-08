@@ -181,8 +181,9 @@ func usage() {
   moshmux <name>                  Attach to named session
   moshmux                         Interactive session picker (fzf)
   moshmux .                       Attach to session matching cwd
-  moshmux list                    Live-updating session status (TUI)
+  moshmux list                    Live-updating session status (TUI, grouped)
   moshmux list --no-tui           Print session table and exit
+  moshmux list --no-tree          Flat list (no directory grouping)
   moshmux add .                   Add cwd (name = directory basename)
   moshmux add . <name>            Add cwd with custom alias name
   moshmux add <name> <target>     Add alias (target = dir or alias name)
@@ -228,9 +229,18 @@ func main() {
 	case ".":
 		cmdDot()
 	case "list":
-		explicitNoTUI := len(os.Args) > 2 && os.Args[2] == "--no-tui"
+		noTUI := false
+		noTree := false
+		for _, arg := range os.Args[2:] {
+			switch arg {
+			case "--no-tui":
+				noTUI = true
+			case "--no-tree":
+				noTree = true
+			}
+		}
 		isPiped := !term.IsTerminal(int(os.Stdout.Fd()))
-		cmdList(explicitNoTUI || isPiped)
+		cmdList(noTUI || isPiped, noTree)
 	case "add":
 		handleAdd()
 	case "update":
@@ -787,6 +797,7 @@ type tickMsg time.Time
 type listModel struct {
 	aliases []moshmux.Alias
 	rows    [][]string
+	noTree  bool
 }
 
 func (m listModel) Init() tea.Cmd {
@@ -798,7 +809,12 @@ func (m listModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m, tea.Quit
 	case tickMsg:
-		m.rows = buildRows(m.aliases, tmuxSessions())
+		sessions := tmuxSessions()
+		if m.noTree {
+			m.rows = buildRows(m.aliases, sessions)
+		} else {
+			m.rows = buildTreeRows(m.aliases, sessions)
+		}
 		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 	}
 	return m, nil
@@ -865,41 +881,157 @@ func sortAliasesByActivity(aliases []moshmux.Alias, sessions map[string]sessionI
 	return append(active, inactive...)
 }
 
-func buildRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][]string {
-	// Sort aliases by activity
-	aliases = sortAliasesByActivity(aliases, sessions)
-
-	rows := [][]string{}
+// groupAliasesByDir groups aliases that share the same normalized directory.
+// Each group has the canonical alias first, followed by children sorted alphabetically.
+// The canonical alias is chosen as: the alias whose Name is used as Session by
+// another alias in the group, then the alias where Name == Session, then alphabetically first.
+func groupAliasesByDir(aliases []moshmux.Alias) [][]moshmux.Alias {
+	// Build map keyed by normalized dir
+	byDir := make(map[string][]moshmux.Alias)
+	var dirOrder []string
 	for _, a := range aliases {
-		status := "-"
-		actual := ""
-		lastActive := "-"
+		norm := expandHome(a.Dir)
+		if _, seen := byDir[norm]; !seen {
+			dirOrder = append(dirOrder, norm)
+		}
+		byDir[norm] = append(byDir[norm], a)
+	}
 
-		if info, ok := sessions[a.Session]; ok {
-			if info.attached {
-				status = "attached"
-			} else {
-				status = "detached"
-			}
-			if info.cwd != a.Dir {
-				actual = info.cwd
-			}
-			// Format relative time
-			lastActive = formatRelativeTime(info.activity)
+	var groups [][]moshmux.Alias
+	for _, dir := range dirOrder {
+		group := byDir[dir]
+		if len(group) == 1 {
+			groups = append(groups, group)
+			continue
 		}
 
-		displayName := a.Name
-		if a.Session != a.Name {
-			displayName = "* " + a.Name
+		// Find which names are referenced as Session by others in the group
+		sessionRefs := make(map[string]bool)
+		for _, a := range group {
+			if a.Session != a.Name {
+				sessionRefs[a.Session] = true
+			}
 		}
 
-		rows = append(rows, []string{
-			displayName,
-			status,
-			lastActive,
-			a.Dir,
-			actual,
+		// Pick canonical: referenced as session > name==session > alphabetically first
+		canonIdx := 0
+		for i, a := range group {
+			cur := group[canonIdx]
+			// Prefer alias whose name is referenced as a session by others
+			iRef := sessionRefs[a.Name]
+			cRef := sessionRefs[cur.Name]
+			if iRef && !cRef {
+				canonIdx = i
+			} else if iRef == cRef {
+				// Prefer alias where name == session
+				iSelf := a.Name == a.Session
+				cSelf := cur.Name == cur.Session
+				if iSelf && !cSelf {
+					canonIdx = i
+				} else if iSelf == cSelf && a.Name < cur.Name {
+					canonIdx = i
+				}
+			}
+		}
+
+		// Build ordered group: canonical first, then children sorted
+		canon := group[canonIdx]
+		var children []moshmux.Alias
+		for i, a := range group {
+			if i != canonIdx {
+				children = append(children, a)
+			}
+		}
+		sort.Slice(children, func(i, j int) bool {
+			return children[i].Name < children[j].Name
 		})
+		groups = append(groups, append([]moshmux.Alias{canon}, children...))
+	}
+
+	return groups
+}
+
+// buildTreeRows is like buildRows but groups aliases by directory
+// and renders ASCII tree prefixes in the ALIAS column.
+func buildTreeRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][]string {
+	aliases = sortAliasesByActivity(aliases, sessions)
+	groups := groupAliasesByDir(aliases)
+
+	// Sort groups by the canonical alias's activity (same ordering as sortAliasesByActivity)
+	sort.SliceStable(groups, func(i, j int) bool {
+		ci := groups[i][0]
+		cj := groups[j][0]
+		si, iActive := sessions[ci.Session]
+		sj, jActive := sessions[cj.Session]
+		// Active groups before inactive
+		if iActive != jActive {
+			return iActive
+		}
+		// Both active: most recent first
+		if iActive && jActive {
+			return si.activity.After(sj.activity)
+		}
+		return false // preserve order for inactive
+	})
+
+	var rows [][]string
+	for _, group := range groups {
+		canon := group[0]
+		// Render canonical alias row
+		rows = append(rows, buildAliasRow(canon, sessions))
+
+		// Render children with tree prefixes
+		children := group[1:]
+		for i, child := range children {
+			prefix := "├─ "
+			if i == len(children)-1 {
+				prefix = "└─ "
+			}
+			row := buildAliasRow(child, sessions)
+			row[0] = prefix + row[0]
+			// If child shares the same session as canonical, blank out redundant columns
+			if child.Session == canon.Session || child.Session == canon.Name {
+				row[1] = "" // status
+				row[2] = "" // last active
+				row[4] = "" // actual cwd
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows
+}
+
+// buildAliasRow renders a single alias as a table row.
+func buildAliasRow(a moshmux.Alias, sessions map[string]sessionInfo) []string {
+	status := "-"
+	actual := ""
+	lastActive := "-"
+
+	if info, ok := sessions[a.Session]; ok {
+		if info.attached {
+			status = "attached"
+		} else {
+			status = "detached"
+		}
+		if info.cwd != a.Dir {
+			actual = info.cwd
+		}
+		lastActive = formatRelativeTime(info.activity)
+	}
+
+	displayName := a.Name
+	if a.Session != a.Name {
+		displayName = "* " + a.Name
+	}
+
+	return []string{displayName, status, lastActive, a.Dir, actual}
+}
+
+func buildRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][]string {
+	aliases = sortAliasesByActivity(aliases, sessions)
+	var rows [][]string
+	for _, a := range aliases {
+		rows = append(rows, buildAliasRow(a, sessions))
 	}
 	return rows
 }
@@ -932,21 +1064,30 @@ func renderTable(rows [][]string) string {
 	return t.String()
 }
 
-func cmdList(noTUI bool) {
+func cmdList(noTUI, noTree bool) {
 	aliases := readAliases()
 	if len(aliases) == 0 {
 		fmt.Println("No aliases configured.")
 		return
 	}
 
+	sessions := tmuxSessions()
+	var rows [][]string
+	if noTree {
+		rows = buildRows(aliases, sessions)
+	} else {
+		rows = buildTreeRows(aliases, sessions)
+	}
+
 	if noTUI {
-		fmt.Println(renderTable(buildRows(aliases, tmuxSessions())))
+		fmt.Println(renderTable(rows))
 		return
 	}
 
 	m := listModel{
 		aliases: aliases,
-		rows:    buildRows(aliases, tmuxSessions()),
+		rows:    rows,
+		noTree:  noTree,
 	}
 
 	p := tea.NewProgram(m)
