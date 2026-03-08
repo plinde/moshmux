@@ -797,6 +797,7 @@ type tickMsg time.Time
 type listModel struct {
 	aliases []moshmux.Alias
 	rows    [][]string
+	tree    *treeResult // non-nil when tree mode is active
 	noTree  bool
 }
 
@@ -812,8 +813,11 @@ func (m listModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		sessions := tmuxSessions()
 		if m.noTree {
 			m.rows = buildRows(m.aliases, sessions)
+			m.tree = nil
 		} else {
-			m.rows = buildTreeRows(m.aliases, sessions)
+			tr := buildTreeRows(m.aliases, sessions)
+			m.rows = tr.rows
+			m.tree = &tr
 		}
 		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 	}
@@ -821,7 +825,13 @@ func (m listModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m listModel) View() string {
-	return renderTable(m.rows) + "\n" + lipgloss.NewStyle().Faint(true).Render("Press any key to quit • refreshes every 2s")
+	var tbl string
+	if m.tree != nil {
+		tbl = renderTreeTable(*m.tree)
+	} else {
+		tbl = renderTable(m.rows)
+	}
+	return tbl + "\n" + lipgloss.NewStyle().Faint(true).Render("Press any key to quit • refreshes every 2s")
 }
 
 // formatRelativeTime formats a timestamp as relative time (e.g., "2m ago", "5h ago")
@@ -953,7 +963,14 @@ func groupAliasesByDir(aliases []moshmux.Alias) [][]moshmux.Alias {
 
 // buildTreeRows is like buildRows but groups aliases by directory
 // and renders ASCII tree prefixes in the ALIAS column.
-func buildTreeRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][]string {
+// treeResult holds the output of buildTreeRows: rows plus the row indices
+// where a new group starts (used to draw horizontal separators).
+type treeResult struct {
+	rows      [][]string
+	groupSeps []int // row indices where a group boundary separator should appear above
+}
+
+func buildTreeRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) treeResult {
 	aliases = sortAliasesByActivity(aliases, sessions)
 	groups := groupAliasesByDir(aliases)
 
@@ -975,7 +992,11 @@ func buildTreeRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][
 	})
 
 	var rows [][]string
-	for _, group := range groups {
+	var seps []int
+	for gi, group := range groups {
+		if gi > 0 {
+			seps = append(seps, len(rows))
+		}
 		canon := group[0]
 		// Render canonical alias row
 		rows = append(rows, buildAliasRow(canon, sessions))
@@ -998,7 +1019,7 @@ func buildTreeRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][
 			rows = append(rows, row)
 		}
 	}
-	return rows
+	return treeResult{rows: rows, groupSeps: seps}
 }
 
 // buildAliasRow renders a single alias as a table row.
@@ -1034,6 +1055,75 @@ func buildRows(aliases []moshmux.Alias, sessions map[string]sessionInfo) [][]str
 		rows = append(rows, buildAliasRow(a, sessions))
 	}
 	return rows
+}
+
+// renderTreeTable renders a table with horizontal separators between groups.
+// It renders with BorderRow enabled, then strips separator lines between rows
+// within the same group, keeping only the inter-group separators.
+func renderTreeTable(tr treeResult) string {
+	rows := tr.rows
+	dim := lipgloss.NewStyle().Faint(true)
+
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(dim).
+		BorderRow(true).
+		Headers("ALIAS", "STATUS", "LAST ACTIVE", "CONFIGURED", "ACTUAL CWD").
+		StyleFunc(func(row, col int) lipgloss.Style {
+			if row == table.HeaderRow {
+				return lipgloss.NewStyle().Bold(true)
+			}
+			if col == 1 && row >= 0 && row < len(rows) {
+				switch rows[row][1] {
+				case "attached":
+					return lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+				case "detached":
+					return lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+				default:
+					return dim
+				}
+			}
+			return lipgloss.NewStyle()
+		}).
+		Rows(rows...)
+
+	rendered := t.String()
+
+	// Build set of row indices that ARE group separators (should keep their border line)
+	sepSet := make(map[int]bool)
+	for _, idx := range tr.groupSeps {
+		sepSet[idx] = true
+	}
+
+	// The rendered table has a separator line (├─...─┤) after each data row
+	// (except the last). We need to strip separator lines for rows that are NOT
+	// group boundaries. Data rows and separator lines alternate after the header.
+	//
+	// Layout of rendered lines:
+	//   line 0: top border      ╭─...─╮
+	//   line 1: header row      │ ... │
+	//   line 2: header sep      ├─...─┤
+	//   line 3: data row 0      │ ... │
+	//   line 4: row sep 0→1     ├─...─┤  (keep if row 1 is a group boundary)
+	//   line 5: data row 1      │ ... │
+	//   line 6: row sep 1→2     ├─...─┤  (keep if row 2 is a group boundary)
+	//   ...
+	//   last:   bottom border   ╰─...─╯
+	lines := strings.Split(rendered, "\n")
+	var out []string
+	for i, line := range lines {
+		// Separator lines appear at line indices 4, 6, 8, ... (every 2 after header sep)
+		// For line index i (0-based), the corresponding "before row" index is:
+		//   dataRow = (i - 4) / 2 + 1   (the row AFTER this separator)
+		if i >= 4 && i < len(lines)-1 && (i-4)%2 == 0 {
+			dataRowAfter := (i-4)/2 + 1
+			if !sepSet[dataRowAfter] {
+				continue // strip this intra-group separator
+			}
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 func renderTable(rows [][]string) string {
@@ -1072,21 +1162,30 @@ func cmdList(noTUI, noTree bool) {
 	}
 
 	sessions := tmuxSessions()
+
 	var rows [][]string
+	var tree *treeResult
 	if noTree {
 		rows = buildRows(aliases, sessions)
 	} else {
-		rows = buildTreeRows(aliases, sessions)
+		tr := buildTreeRows(aliases, sessions)
+		rows = tr.rows
+		tree = &tr
 	}
 
 	if noTUI {
-		fmt.Println(renderTable(rows))
+		if tree != nil {
+			fmt.Println(renderTreeTable(*tree))
+		} else {
+			fmt.Println(renderTable(rows))
+		}
 		return
 	}
 
 	m := listModel{
 		aliases: aliases,
 		rows:    rows,
+		tree:    tree,
 		noTree:  noTree,
 	}
 
