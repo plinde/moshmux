@@ -1,8 +1,9 @@
 # moshmux Makefile
 
 BINARY := moshmux
+INSTALL_DIR := $(HOME)/.local/bin
 
-.PHONY: build run clean deps check lint test fmt setup update help
+.PHONY: build run install clean deps check lint test fmt setup update help
 
 .DEFAULT_GOAL := help
 
@@ -13,6 +14,14 @@ build: ## Build moshmux binary
 
 run: build ## Build and run moshmux
 	./$(BINARY)
+
+install: build ## Install moshmux to ~/.local/bin (re-codesigns on macOS)
+	mkdir -p $(INSTALL_DIR)
+	cp $(BINARY) $(INSTALL_DIR)/$(BINARY)
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		codesign --force --sign - $(INSTALL_DIR)/$(BINARY) && \
+		echo "codesigned $(INSTALL_DIR)/$(BINARY)"; \
+	fi
 
 deps: ## Download Go dependencies
 	go mod download
